@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sähkön tuntihinnat</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1 id="mainTitle">Sähkön tuntihinnat</h1>
+            <p class="subtitle">Suomen spot-hinnat (c/kWh)</p>
+            <p id="lastUpdate" class="last-update"></p>
+        </header>
+
+        <div class="view-nav">
+            <button id="viewGridBtn" class="view-btn">Ruudukko</button>
+            <button id="viewListBtn" class="view-btn active">Lista</button>
+            <span class="swipe-hint">Pyyhkäise taulukkoa vasemmalle / oikealle</span>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <span class="stat-label">Keskihinta</span>
+                <span class="stat-value" id="avgPrice">-</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Halvin</span>
+                <span class="stat-value" id="minPrice">-</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Kallein</span>
+                <span class="stat-value" id="maxPrice">-</span>
+            </div>
+        </div>
+
+        <div id="pricesContainer" class="prices-grid">
+            <div class="loading">Ladataan hintoja...</div>
+        </div>
+
+        <footer>
+            <p>Tiedot: porssisahko.net</p>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
