@@ -1,18 +1,23 @@
-// Backend API
-// # const API_URL = '/api/prices';
+// Remote price API + fallbacks (mirrors `app.py`)
 const API_URL = "https://api.porssisahko.net/v1/latest-prices.json";
+const PROXY_PREFIXES = [
+    "https://api.allorigins.win/raw?url=",
+    "https://cors.bridged.cc/",
+    "https://api.codetabs.com/v1/proxy?quest="
+];
+const PRICE_URLS = [API_URL, ...PROXY_PREFIXES.map(p => p + API_URL)];
 const TIMEZONE = 'Europe/Helsinki';
 const HOUR_RANGE_START = 6;
 const HOUR_RANGE_END = 22;
 const UPDATE_INTERVAL = 60 * 1000; // Päivitä näkymä minuutin välein
-const API_CACHE_TIME = 12 * 60 * 60 * 1000; // 12-14 tunnin väli
-const RETRY_MIN = 45 * 60 * 1000; // 45 minuuttia
-const RETRY_MAX = 90 * 60 * 1000; // 90 minuuttia
+const CACHE_REFRESH_HOUR = 14;
+const CACHE_REFRESH_MINUTE = 30;
+
+const STORAGE_KEY = 'hintaprojekti_prices_cache_v1';
 
 // State
-let cachedData = null; // { prices, fetchedAt }
-let lastFetchTime = null;
-let failureRetryTime = null;
+let cachedData = null; // { prices, fetchedAt, source, rawPrices }
+let lastFetchTime = null; // ms since epoch
 
 // DOM elements
 const pricesContainer = document.getElementById('pricesContainer');
@@ -38,6 +43,67 @@ function getTomorrow(date) {
 
 function isSameDay(a, b) {
     return a.getTime() === b.getTime();
+}
+
+function getTodayRefreshCutoff(now = new Date()) {
+    return new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        CACHE_REFRESH_HOUR,
+        CACHE_REFRESH_MINUTE,
+        0,
+        0
+    );
+}
+
+function normalizePrices(rawPrices) {
+    if (!Array.isArray(rawPrices)) return [];
+    const prices = rawPrices.map(p => {
+        const startDate = new Date(p.startDate);
+        return {
+            time: startDate,
+            price: p.price,
+            hour: startDate.getHours(),
+            date: new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate())
+        };
+    });
+    prices.sort((a, b) => a.time - b.time);
+    return prices;
+}
+
+function loadCacheFromStorage() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || !Array.isArray(parsed.rawPrices) || !parsed.fetchedAt) return null;
+        const fetchedAtMs = Date.parse(parsed.fetchedAt);
+        if (!Number.isFinite(fetchedAtMs)) return null;
+
+        return {
+            rawPrices: parsed.rawPrices,
+            prices: normalizePrices(parsed.rawPrices),
+            fetchedAt: parsed.fetchedAt,
+            source: parsed.source || null,
+            fetchedAtMs,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function saveCacheToStorage(data) {
+    try {
+        const payload = {
+            rawPrices: data.rawPrices,
+            fetchedAt: data.fetchedAt,
+            source: data.source || null,
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+        // ignore storage errors (quota/private mode)
+    }
 }
 
 // Event listeners
@@ -83,72 +149,90 @@ async function loadAndDisplay() {
 }
 
 async function getPricesWithCache() {
-    const now = Date.now();
-    const today = new Date();
-    const currentDayKey = getDateKey(today);
+    const now = new Date();
+    const nowMs = now.getTime();
 
-    if (cachedData && lastFetchTime) {
-        const lastFetchDayKey = getDateKey(new Date(lastFetchTime));
-        if (currentDayKey !== lastFetchDayKey) {
-            cachedData = null;
-            lastFetchTime = null;
+    if (!cachedData) {
+        const stored = loadCacheFromStorage();
+        if (stored) {
+            cachedData = {
+                prices: stored.prices,
+                rawPrices: stored.rawPrices,
+                fetchedAt: stored.fetchedAt,
+                source: stored.source,
+            };
+            lastFetchTime = stored.fetchedAtMs;
         }
     }
 
-    // Jos viimeinen lataus oli alle 12-14 tuntia sitten, käytä cachea
-    if (cachedData && lastFetchTime && (now - lastFetchTime) < API_CACHE_TIME) {
+    // 1) If no cache -> fetch newest
+    if (!cachedData || !cachedData.rawPrices || !cachedData.prices || cachedData.prices.length === 0) {
+        const fresh = await fetchPrices();
+        cachedData = fresh;
+        lastFetchTime = Date.parse(fresh.fetchedAt);
+        saveCacheToStorage(fresh);
+        return fresh;
+    }
+
+    // 2) Cache exists: refresh only after 14:30 local time
+    const cutoff = getTodayRefreshCutoff(now).getTime();
+    if (nowMs < cutoff) {
         return cachedData;
     }
-    
-    // Jos epäonnistumisen jälkeen ei ole kulunut 45-90 minuuttia, yritä uudelleen
-    if (failureRetryTime && (now - failureRetryTime) < RETRY_MIN) {
-        const waitTime = RETRY_MIN - (now - failureRetryTime);
-        throw new Error(`Odotellaan uudelleenyritystä (${Math.ceil(waitTime / 1000 / 60)} min)`);
+
+    // After 14:30: refresh if cache is from before today's cutoff
+    if (lastFetchTime && lastFetchTime >= cutoff) {
+        return cachedData;
     }
-    
+
     try {
-        const data = await fetchPrices();
-        lastFetchTime = now;
-        failureRetryTime = null;
-        return data;
-    } catch (error) {
-        // Aseta uudelleenyritysaika (45-90 min)
-        const retryDelay = RETRY_MIN + Math.random() * (RETRY_MAX - RETRY_MIN);
-        failureRetryTime = now;
-        
-        // Yritä uudelleen automaattisesti myöhemmin
-        setTimeout(() => {
-            lastFetchTime = 0;
-            loadAndDisplay();
-        }, retryDelay);
-        
-        throw error;
+        const fresh = await fetchPrices();
+        cachedData = fresh;
+        lastFetchTime = Date.parse(fresh.fetchedAt);
+        saveCacheToStorage(fresh);
+        return fresh;
+    } catch (err) {
+        // If refresh fails, fall back to cached data
+        console.warn('Uusien hintojen lataus epäonnistui, käytetään välimuistia:', err);
+        return cachedData;
     }
 }
 
 async function fetchPrices() {
-    const response = await fetch(API_URL, { cache: 'no-store' });
-    if (!response.ok) {
-        throw new Error(`API virhe: ${response.status}`);
+    let lastError = null;
+    let data = null;
+    let source = null;
+
+    for (const url of PRICE_URLS) {
+        try {
+            const response = await fetch(url, {
+                cache: 'no-store',
+                headers: { 'Accept': 'application/json' }
+            });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const json = await response.json();
+            if (!json || !Array.isArray(json.prices) || json.prices.length === 0) {
+                throw new Error('Väärä vastausrakenne tai ei hintoja');
+            }
+
+            data = json;
+            source = url;
+            break;
+        } catch (err) {
+            lastError = err;
+        }
     }
 
-    const data = await response.json();
-    if (!data.prices || data.prices.length === 0) {
-        throw new Error('Ei hintoja vastauksessa');
+    if (!data) {
+        throw new Error(`Kaikki hinnanhoitoyritykset epäonnistuivat: ${lastError?.message || lastError}`);
     }
 
-    const prices = data.prices.map(p => {
-        const startDate = new Date(p.startDate);
-        return {
-            time: startDate,
-            price: p.price,
-            hour: startDate.getHours(),
-            date: new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate())
-        };
-    });
-
-    prices.sort((a, b) => a.time - b.time);
-    return { prices, fetchedAt: data.fetched_at };
+    const rawPrices = data.prices;
+    const prices = normalizePrices(rawPrices);
+    // `latest-prices.json` doesn't include `fetched_at`, so set it locally.
+    return { prices, rawPrices, fetchedAt: new Date().toISOString(), source };
 }
 
 function displayGridView(filteredPrices, currentHour, today, tomorrow) {
@@ -437,7 +521,7 @@ function updateLastUpdate() {
     });
     const fullStr = `${dateStr} klo ${timeStr}`;
     
-    // Käytä backendin päivitysaikaa jos saatavilla
+    // Käytä latausajan arvoa jos saatavilla
     let updateTimeStr = timeStr;
     if (cachedData && cachedData.fetchedAt) {
         try {
@@ -452,7 +536,8 @@ function updateLastUpdate() {
     }
     
     mainTitleEl.textContent = `Sähkön tuntihinnat - ${dateStr} klo ${updateTimeStr}`;
-    lastUpdateEl.textContent = `Backend päivittynyt: ${updateTimeStr}`;
+    const sourceText = cachedData?.source ? ` (lähde: ${cachedData.source})` : '';
+    lastUpdateEl.textContent = `Päivitetty: ${updateTimeStr}${sourceText}`;
 }
 
 function formatDateTime(date) {
