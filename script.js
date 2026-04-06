@@ -277,33 +277,46 @@ function displayGridView(filteredPrices, currentHour, today, tomorrow) {
 }
 
 function displayListView(filteredPrices, currentHour, today) {
-    // Yhdistä kaikki tunnit ja järjestä päivämäärän ja tunnin mukaan kronologisesti
-    const allPrices = [...filteredPrices].sort((a, b) => {
-        if (a.date.getTime() !== b.date.getTime()) {
-            return a.date - b.date;
+    const dateGroups = filteredPrices.reduce((acc, p) => {
+        const dateKey = p.date.getTime();
+        const dateStr = p.date.toLocaleDateString('fi-FI', { weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit' });
+        if (!acc[dateKey]) {
+            acc[dateKey] = { date: p.date, dateStr, prices: [] };
         }
-        return a.hour - b.hour;
-    });
+        acc[dateKey].prices.push(p);
+        return acc;
+    }, {});
 
-    // Etsi 3 halvinta ja 3 kalleinta koko datasta
-    const cheapTimes = getTopPrices(allPrices, 3, true);
-    const expensiveTimes = getTopPrices(allPrices, 3, false);
+    const sortedGroups = Object.entries(dateGroups)
+        .sort(([a], [b]) => Number(a) - Number(b))
+        .map(([, group]) => group);
 
-    const minPrice = Math.min(...allPrices.map(p => p.price));
-    const maxPrice = Math.max(...allPrices.map(p => p.price));
-    const priceRange = Math.max(1, maxPrice - minPrice);
+    let html = '';
+    for (const group of sortedGroups) {
+        if (!group.prices.length) continue;
 
-    const pricedPrices = allPrices.map(p => ({
-        ...p,
-        category: expensiveTimes.includes(p.time.getTime()) ? 'expensive' :
-                  cheapTimes.includes(p.time.getTime()) ? 'cheap' :
-                  'moderate',
-        widthPercent: 25 + ((p.price - minPrice) / priceRange) * 70
-    }));
+        // Päiväkohtainen vertailu: halvimmat/kalleimmat vain tämän päivän tunneista
+        const cheapTimes = getTopPrices(group.prices, 3, true);
+        const expensiveTimes = getTopPrices(group.prices, 3, false);
 
-    let html = '<div class="list-view">';
-    html += pricedPrices.map(p => createHourBar(p, currentHour, today)).join('');
-    html += '</div>';
+        const minPrice = Math.min(...group.prices.map(p => p.price));
+        const maxPrice = Math.max(...group.prices.map(p => p.price));
+        const priceRange = Math.max(1e-9, maxPrice - minPrice);
+
+        const pricedPrices = [...group.prices]
+            .sort((a, b) => a.hour - b.hour)
+            .map(p => ({
+                ...p,
+                category: expensiveTimes.includes(p.time.getTime()) ? 'expensive' :
+                          cheapTimes.includes(p.time.getTime()) ? 'cheap' :
+                          'moderate',
+                widthPercent: 25 + ((p.price - minPrice) / priceRange) * 70
+            }));
+
+        html += `<div class="day-section"><h2>${group.dateStr}</h2><div class="list-view">`;
+        html += pricedPrices.map(p => createHourBar(p, currentHour, today)).join('');
+        html += '</div></div>';
+    }
 
     pricesContainer.innerHTML = html;
 }
