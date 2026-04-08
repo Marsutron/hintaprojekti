@@ -2,19 +2,15 @@
 // Config
 // =========================
 const CONFIG = {
-    apiUrl: "https://api.porssisahko.net/v1/latest-prices.json",
-    proxyPrefixes: [
-        "https://api.allorigins.win/raw?url=",
-        "https://cors.bridged.cc/",
-        "https://api.codetabs.com/v1/proxy?quest="
-    ],
+    // Käytetään omaa PHP-proxyä, jotta vältetään CORS-ongelmat kotisivudomainilta.
+    // Oletus: index.html ja api-kansio ovat samassa juurihakemistossa.
+    // Esim. /joku/polku/index.html -> /joku/polku/api/proxy.php
+    apiUrl: "api/proxy.php",
     hourRange: { start: 6, end: 22 },
     refreshCutoff: { hour: 14, minute: 30 }, // local time
     updateIntervalMs: 60 * 1000,
     storageKey: 'hintaprojekti_prices_cache_v1'
 };
-
-const PRICE_URLS = [CONFIG.apiUrl, ...CONFIG.proxyPrefixes.map(p => p + CONFIG.apiUrl)];
 
 // =========================
 // State + DOM
@@ -22,19 +18,32 @@ const PRICE_URLS = [CONFIG.apiUrl, ...CONFIG.proxyPrefixes.map(p => p + CONFIG.a
 const state = {
     selectedViewIndex: 1, // 0 = grid, 1 = list
     data: null, // { prices, rawPrices, fetchedAt, source }
-    lastFetchMs: null
+    lastFetchMs: null,
+    noticeHtml: null
 };
 
-const dom = {
-    pricesContainer: document.getElementById('pricesContainer'),
-    avgPrice: document.getElementById('avgPrice'),
-    minPrice: document.getElementById('minPrice'),
-    maxPrice: document.getElementById('maxPrice'),
-    lastUpdate: document.getElementById('lastUpdate'),
-    viewGridBtn: document.getElementById('viewGridBtn'),
-    viewListBtn: document.getElementById('viewListBtn'),
-    mainTitle: document.getElementById('mainTitle')
-};
+const dom = {};
+
+function initDom() {
+    dom.pricesContainer = document.getElementById('pricesContainer');
+    dom.avgPrice = document.getElementById('avgPrice');
+    dom.minPrice = document.getElementById('minPrice');
+    dom.maxPrice = document.getElementById('maxPrice');
+    dom.lastUpdate = document.getElementById('lastUpdate');
+    dom.mainTitle = document.getElementById('mainTitle');
+    dom.viewGridBtn = document.getElementById('viewGridBtn');
+    dom.viewListBtn = document.getElementById('viewListBtn');
+
+    // Välttämättömät elementit, jotta sovellus voi piirtää mitään.
+    const essentialKeys = ['pricesContainer', 'avgPrice', 'minPrice', 'maxPrice', 'lastUpdate', 'mainTitle'];
+    const missing = essentialKeys.filter(k => !dom[k]);
+    if (missing.length > 0) {
+        console.error(`hintaprojekti: puuttuvat elementit: ${missing.join(', ')}`);
+        return false;
+    }
+
+    return true;
+}
 
 // =========================
 // Date helpers
@@ -144,11 +153,55 @@ function saveCacheToStorage(data) {
 // =========================
 // API
 // =========================
-async function fetchPrices() {
-    let lastError = null;
-    for (const url of PRICE_URLS) {
+function getReadableFetchError(err) {
+    const message = err?.message || String(err);
+    if (/Failed to fetch/i.test(message)) {
+        return 'Selaimesta tehty pyyntö API:lle estyy (tyypillisesti CORS) tai verkkoyhteys ei toimi.';
+    }
+    if (/HTTP\s+\d+/i.test(message)) {
+        return 'API palautti virheen, eikä hintoja saatu ladattua.';
+    }
+    return 'Hinnat eivät latautuneet odotetusti.';
+}
+
+function formatFiTimeOrDash(isoString) {
+    if (!isoString) return '-';
+    const d = new Date(isoString);
+    if (Number.isNaN(d.getTime())) return '-';
+    return d.toLocaleTimeString('fi-FI', { hour: '2-digit', minute: '2-digit' });
+}
+
+function buildNoticeHtml(type, text) {
+    const cls = type === 'warning' ? 'warning' : 'error';
+    return `<div class="notice ${cls}" role="alert">${text}</div>`;
+}
+
+async function getPricesWithCache() {
+    // Yksi paikka jossa sekä välimuistin luku että mahdollinen haku+päivitys
+    state.noticeHtml = null;
+
+    const now = new Date();
+    const cutoffMs = getTodayRefreshCutoff(now).getTime();
+    const nowMs = now.getTime();
+
+    let cached = null;
+    if (state.data?.prices?.length && state.data?.rawPrices?.length) {
+        cached = state.data;
+    } else {
+        const stored = loadCacheFromStorage();
+        if (stored?.prices?.length && stored?.rawPrices?.length) {
+            cached = { prices: stored.prices, rawPrices: stored.rawPrices, fetchedAt: stored.fetchedAt, source: stored.source };
+            state.lastFetchMs = stored.fetchedAtMs;
+        }
+    }
+
+    const hasCache = !!cached?.prices?.length && !!cached?.rawPrices?.length;
+    const fetchedAtMs = state.lastFetchMs;
+
+    // Jos ei ole välimuistia, haetaan aina.
+    if (!hasCache) {
         try {
-            const response = await fetch(url, {
+            const response = await fetch(CONFIG.apiUrl, {
                 cache: 'no-store',
                 headers: { 'Accept': 'application/json' }
             });
@@ -160,63 +213,103 @@ async function fetchPrices() {
             }
 
             const rawPrices = json.prices;
-            return {
+            const fresh = {
                 rawPrices,
                 prices: normalizePrices(rawPrices),
                 fetchedAt: new Date().toISOString(), // API doesn't provide fetched_at
-                source: url
+                source: CONFIG.apiUrl
             };
+
+            state.data = fresh;
+            state.lastFetchMs = Date.parse(fresh.fetchedAt);
+            saveCacheToStorage(fresh);
+            return fresh;
         } catch (err) {
-            lastError = err;
-        }
-    }
-    throw new Error(`Kaikki hinnanhoitoyritykset epäonnistuivat: ${lastError?.message || lastError}`);
-}
-
-async function getPricesWithCache() {
-    const now = new Date();
-    const cutoffMs = getTodayRefreshCutoff(now).getTime();
-
-    if (!state.data) {
-        const stored = loadCacheFromStorage();
-        if (stored) {
-            state.data = { prices: stored.prices, rawPrices: stored.rawPrices, fetchedAt: stored.fetchedAt, source: stored.source };
-            state.lastFetchMs = stored.fetchedAtMs;
+            console.error('Virhe hintojen latauksessa:', err);
+            const details = getReadableFetchError(err);
+            throw new Error(
+                `Hintoja ei saatu ladattua. ${details} ` +
+                `Tämä sovellus ei käytä välityspalvelimia, joten CORS-estot voivat estää suoran latauksen.`
+            );
         }
     }
 
-    // No cache -> always fetch
-    if (!state.data?.prices?.length || !state.data?.rawPrices?.length) {
-        const fresh = await fetchPrices();
-        state.data = fresh;
-        state.lastFetchMs = Date.parse(fresh.fetchedAt);
-        saveCacheToStorage(fresh);
-        return fresh;
-    }
-
-    // Cache exists -> only refresh after cutoff
-    const nowMs = now.getTime();
-    if (nowMs < cutoffMs) return state.data;
-    if (state.lastFetchMs && state.lastFetchMs >= cutoffMs) return state.data;
+    // Välimuisti on käytössä:
+    // - käytä välimuistia ennen cutoff-aikaa
+    // - yritä päivittää vasta cutoffin jälkeen (jos emme ole jo päivittäneet cutoffin jälkeen)
+    if (nowMs < cutoffMs) return cached;
+    if (fetchedAtMs && fetchedAtMs >= cutoffMs) return cached;
 
     try {
-        const fresh = await fetchPrices();
+        const response = await fetch(CONFIG.apiUrl, {
+            cache: 'no-store',
+            headers: { 'Accept': 'application/json' }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const json = await response.json();
+        if (!json || !Array.isArray(json.prices) || json.prices.length === 0) {
+            throw new Error('Väärä vastausrakenne tai ei hintoja');
+        }
+
+        const rawPrices = json.prices;
+        const fresh = {
+            rawPrices,
+            prices: normalizePrices(rawPrices),
+            fetchedAt: new Date().toISOString(), // API doesn't provide fetched_at
+            source: CONFIG.apiUrl
+        };
+
         state.data = fresh;
         state.lastFetchMs = Date.parse(fresh.fetchedAt);
         saveCacheToStorage(fresh);
         return fresh;
     } catch (err) {
-        console.warn('Uusien hintojen lataus epäonnistui, käytetään välimuistia:', err);
-        return state.data;
+        // Päivitys epäonnistui, mutta meillä on välimuisti -> käytetään sitä ja kerrotaan käyttäjälle.
+        console.warn('Hintojen päivitys epäonnistui, käytetään välimuistia:', err);
+
+        const details = getReadableFetchError(err);
+        const cachedTime = formatFiTimeOrDash(cached.fetchedAt);
+        state.noticeHtml = buildNoticeHtml(
+            'warning',
+            `Päivitys epäonnistui. Näytetään viimeksi ladatut hinnat (päivitetty ${cachedTime}). ${details}`
+        );
+        return cached;
     }
 }
 
 // =========================
 // App lifecycle
 // =========================
-document.addEventListener('DOMContentLoaded', initializeApp);
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializeApp);
+} else {
+    initializeApp();
+}
 
 function initializeApp() {
+    // Estä moninkertainen alustus (esim. jos sama skripti on liitetty sivulle useaan kertaan).
+    const initKey = '__hintaprojekti_prices_app_v1__';
+    if (window[initKey]) return;
+
+    // Kotisivuympäristöissä DOM voi olla vielä rakentumassa (SPA/teemat).
+    // Yritetään rajatusti uudelleen, jos pakolliset elementit eivät ole vielä paikalla.
+    const retryKey = '__hintaprojekti_prices_app_retries_v1__';
+    const currentRetries = window[retryKey] || 0;
+    if (!initDom()) {
+        const maxRetries = 20;
+        if (currentRetries < maxRetries) {
+            window[retryKey] = currentRetries + 1;
+            setTimeout(() => initializeApp(), 150);
+        } else {
+            console.error('hintaprojekti: sovellus ei löytänyt tarvittavia DOM-elementtejä.');
+        }
+        return;
+    }
+
+    window[retryKey] = 0;
+    window[initKey] = true;
+
     updateViewButtons();
     addViewNavigationListeners();
     addSwipeListeners();
@@ -240,6 +333,7 @@ function initializeApp() {
 
 async function loadAndRender() {
     try {
+        state.noticeHtml = null;
         const data = await getPricesWithCache();
         state.data = data;
         state.lastFetchMs = Date.parse(data.fetchedAt);
@@ -247,9 +341,19 @@ async function loadAndRender() {
         renderPrices(data.prices);
         renderStats(data.prices);
         renderLastUpdate();
+
+        if (state.noticeHtml) {
+            // Näytä varoitus kerran, jotta ei näytä sitä “joka renderöinnissä”.
+            dom.pricesContainer.insertAdjacentHTML('afterbegin', state.noticeHtml);
+            state.noticeHtml = null;
+        }
     } catch (error) {
         console.error('Virhe hintojen lataamisessa:', error);
-        dom.pricesContainer.innerHTML = `<div class="error">Virhe hintojen lataamisessa. Yritetään uudelleen myöhemmin...</div>`;
+        state.noticeHtml = null;
+        dom.pricesContainer.innerHTML = buildNoticeHtml(
+            'error',
+            error?.message ? error.message : 'Virhe hintojen lataamisessa. Yritetään uudelleen myöhemmin...'
+        );
     }
 }
 
@@ -351,7 +455,7 @@ function displayPrices(prices) {
         p.hour <= CONFIG.hourRange.end
     );
     if (filteredPrices.length === 0) {
-        dom.pricesContainer.innerHTML = '<div class="error">Ei hintoja nykyiselle tai seuraavalle päivälle.</div>';
+        dom.pricesContainer.innerHTML = '<div class="error">Ei hinttoja nykyiselle tai seuraavalle päivälle.</div>';
         return;
     }
 
@@ -398,13 +502,21 @@ function setSelectedView(index) {
 }
 
 function updateViewButtons() {
-    dom.viewGridBtn.classList.toggle('active', state.selectedViewIndex === 0);
-    dom.viewListBtn.classList.toggle('active', state.selectedViewIndex === 1);
+    if (dom.viewGridBtn) {
+        dom.viewGridBtn.classList.toggle('active', state.selectedViewIndex === 0);
+    }
+    if (dom.viewListBtn) {
+        dom.viewListBtn.classList.toggle('active', state.selectedViewIndex === 1);
+    }
 }
 
 function addViewNavigationListeners() {
-    dom.viewGridBtn.addEventListener('click', () => setSelectedView(0));
-    dom.viewListBtn.addEventListener('click', () => setSelectedView(1));
+    if (dom.viewGridBtn) {
+        dom.viewGridBtn.addEventListener('click', () => setSelectedView(0));
+    }
+    if (dom.viewListBtn) {
+        dom.viewListBtn.addEventListener('click', () => setSelectedView(1));
+    }
 }
 
 function addSwipeListeners() {

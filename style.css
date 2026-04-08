@@ -332,6 +332,19 @@ header .last-update {
     text-align: center;
 }
 
+.notice {
+    grid-column: 1 / -1;
+}
+
+.warning {
+    background: #fff3cd;
+    border: 1px solid #ffeeba;
+    color: #856404;
+    padding: 20px;
+    border-radius: 8px;
+    text-align: center;
+}
+
 footer {
     background: #f8f9fa;
     padding: 15px;

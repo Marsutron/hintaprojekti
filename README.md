@@ -6,4 +6,5 @@ Ladataan sähkön spot-hinnat ja esitetään ne selkeänä näkymänä.
 - aja staattinen palvelin projektihakemistossa (esim. `python -m http.server`) ja avaa selaimen kautta.
 
 ## Data
-Hintadata haetaan selaimesta `porssisahko.net` API:sta. Jos suora pyyntö estyy (CORS), sovellus yrittää automaattisesti samoja proxy-URL:ia, jotka olivat aiemmin listattuna `app.py`:ssä.
+Hintadata haetaan selaimesta `porssisahko.net` API:sta. Jos suora pyyntö estyy (CORS) tai verkkoyhteys ei toimi, hintoja ei saada ladattua tämän sovelluksen kautta.
+Sovellus käyttää kuitenkin selaimen välimuistia (`localStorage`), joten viimeksi ladatut hinnat voivat silti näkyä, vaikka päivitys epäonnistuisi.
