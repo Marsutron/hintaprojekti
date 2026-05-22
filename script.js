@@ -2,12 +2,8 @@
 // Config
 // =========================
 const CONFIG = {
-    // Käytetään omaa PHP-proxyä, jotta vältetään CORS-ongelmat kotisivudomainilta.
-    // Oletus: index.html ja api-kansio ovat samassa juurihakemistossa.
-    // Esim. /joku/polku/index.html -> /joku/polku/api/proxy.php
     apiUrl: "api/proxy.php",
     hourRange: { start: 6, end: 22 },
-    refreshCutoff: { hour: 14, minute: 30 }, // local time
     updateIntervalMs: 60 * 1000,
     storageKey: 'hintaprojekti_prices_cache_v1'
 };
@@ -60,18 +56,6 @@ function getTomorrow(date) {
     const d = new Date(date);
     d.setDate(d.getDate() + 1);
     return startOfDay(d);
-}
-
-function getTodayRefreshCutoff(now = new Date()) {
-    return new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        now.getDate(),
-        CONFIG.refreshCutoff.hour,
-        CONFIG.refreshCutoff.minute,
-        0,
-        0
-    );
 }
 
 // =========================
@@ -177,69 +161,35 @@ function buildNoticeHtml(type, text) {
 }
 
 async function getPricesWithCache() {
-    // Yksi paikka jossa sekä välimuistin luku että mahdollinen haku+päivitys
     state.noticeHtml = null;
 
-    const now = new Date();
-    const cutoffMs = getTodayRefreshCutoff(now).getTime();
-    const nowMs = now.getTime();
-
-    let cached = null;
+    // Check if we have data in memory
     if (state.data?.prices?.length && state.data?.rawPrices?.length) {
-        cached = state.data;
-    } else {
-        const stored = loadCacheFromStorage();
-        if (stored?.prices?.length && stored?.rawPrices?.length) {
-            cached = { prices: stored.prices, rawPrices: stored.rawPrices, fetchedAt: stored.fetchedAt, source: stored.source };
+        return state.data;
+    }
+
+    // Check localStorage cache
+    const stored = loadCacheFromStorage();
+
+    // Check if cache is still valid (has prices for today or tomorrow)
+    if (stored?.prices?.length && stored?.rawPrices?.length) {
+        const now = new Date();
+        const today = startOfDay(now);
+        const tomorrow = getTomorrow(today);
+        const validDates = new Set([today.getTime(), tomorrow.getTime()]);
+
+        const hasValidPrices = stored.prices.some(p => validDates.has(p.date.getTime()));
+
+        if (hasValidPrices) {
+            state.data = { prices: stored.prices, rawPrices: stored.rawPrices, fetchedAt: stored.fetchedAt, source: stored.source };
             state.lastFetchMs = stored.fetchedAtMs;
+            return state.data;
+        } else {
+            localStorage.removeItem(CONFIG.storageKey);
         }
     }
 
-    const hasCache = !!cached?.prices?.length && !!cached?.rawPrices?.length;
-    const fetchedAtMs = state.lastFetchMs;
-
-    // Jos ei ole välimuistia, haetaan aina.
-    if (!hasCache) {
-        try {
-            const response = await fetch(CONFIG.apiUrl, {
-                cache: 'no-store',
-                headers: { 'Accept': 'application/json' }
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-            const json = await response.json();
-            if (!json || !Array.isArray(json.prices) || json.prices.length === 0) {
-                throw new Error('Väärä vastausrakenne tai ei hintoja');
-            }
-
-            const rawPrices = json.prices;
-            const fresh = {
-                rawPrices,
-                prices: normalizePrices(rawPrices),
-                fetchedAt: new Date().toISOString(), // API doesn't provide fetched_at
-                source: CONFIG.apiUrl
-            };
-
-            state.data = fresh;
-            state.lastFetchMs = Date.parse(fresh.fetchedAt);
-            saveCacheToStorage(fresh);
-            return fresh;
-        } catch (err) {
-            console.error('Virhe hintojen latauksessa:', err);
-            const details = getReadableFetchError(err);
-            throw new Error(
-                `Hintoja ei saatu ladattua. ${details} ` +
-                `Tämä sovellus ei käytä välityspalvelimia, joten CORS-estot voivat estää suoran latauksen.`
-            );
-        }
-    }
-
-    // Välimuisti on käytössä:
-    // - käytä välimuistia ennen cutoff-aikaa
-    // - yritä päivittää vasta cutoffin jälkeen (jos emme ole jo päivittäneet cutoffin jälkeen)
-    if (nowMs < cutoffMs) return cached;
-    if (fetchedAtMs && fetchedAtMs >= cutoffMs) return cached;
-
+    // No valid cache, fetch from API
     try {
         const response = await fetch(CONFIG.apiUrl, {
             cache: 'no-store',
@@ -256,7 +206,7 @@ async function getPricesWithCache() {
         const fresh = {
             rawPrices,
             prices: normalizePrices(rawPrices),
-            fetchedAt: new Date().toISOString(), // API doesn't provide fetched_at
+            fetchedAt: new Date().toISOString(),
             source: CONFIG.apiUrl
         };
 
@@ -265,17 +215,48 @@ async function getPricesWithCache() {
         saveCacheToStorage(fresh);
         return fresh;
     } catch (err) {
-        // Päivitys epäonnistui, mutta meillä on välimuisti -> käytetään sitä ja kerrotaan käyttäjälle.
-        console.warn('Hintojen päivitys epäonnistui, käytetään välimuistia:', err);
-
+        console.error('Hintojen haku epäonnistui:', err);
         const details = getReadableFetchError(err);
-        const cachedTime = formatFiTimeOrDash(cached.fetchedAt);
-        state.noticeHtml = buildNoticeHtml(
-            'warning',
-            `Päivitys epäonnistui. Näytetään viimeksi ladatut hinnat (päivitetty ${cachedTime}). ${details}`
-        );
-        return cached;
+        throw new Error(`Hintoja ei saatu ladattua. ${details}`);
     }
+}
+
+// =========================
+// Scheduled refreshes
+// =========================
+function getNextRefreshTime() {
+    const now = new Date();
+    const refreshTimes = [
+        { hour: 2, minute: 30 },
+        { hour: 14, minute: 30 }
+    ];
+
+    for (const time of refreshTimes) {
+        const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), time.hour, time.minute, 0, 0);
+        if (next > now) return next;
+    }
+
+    // If we've passed both times today, schedule for 02:30 tomorrow
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return new Date(tomorrow.getFullYear(), tomorrow.getMonth(), tomorrow.getDate(), 2, 30, 0, 0);
+}
+
+function scheduleRefreshes() {
+    function scheduleNext() {
+        const nextRefresh = getNextRefreshTime();
+        const now = new Date();
+        const msUntilRefresh = nextRefresh.getTime() - now.getTime();
+
+        setTimeout(() => {
+            state.data = null;
+            state.lastFetchMs = null;
+            loadAndRender();
+            scheduleNext();
+        }, msUntilRefresh);
+    }
+
+    scheduleNext();
 }
 
 // =========================
@@ -316,16 +297,12 @@ function initializeApp() {
     addKeyboardNavigation();
     loadAndRender();
 
+    // Schedule refreshes at 02:30 and 14:30
+    scheduleRefreshes();
+
+    // Update UI every minute
     setInterval(() => {
-        if (!state.data?.prices?.length || !state.lastFetchMs) return;
-        const now = new Date();
-        const lastFetchDate = new Date(state.lastFetchMs);
-        if (!isSameDay(now, lastFetchDate)) {
-            state.data = null;
-            state.lastFetchMs = null;
-            loadAndRender();
-            return;
-        }
+        if (!state.data?.prices?.length) return;
         renderPrices(state.data.prices);
         renderLastUpdate();
     }, CONFIG.updateIntervalMs);
@@ -343,12 +320,11 @@ async function loadAndRender() {
         renderLastUpdate();
 
         if (state.noticeHtml) {
-            // Näytä varoitus kerran, jotta ei näytä sitä “joka renderöinnissä”.
             dom.pricesContainer.insertAdjacentHTML('afterbegin', state.noticeHtml);
             state.noticeHtml = null;
         }
     } catch (error) {
-        console.error('Virhe hintojen lataamisessa:', error);
+        console.error('loadAndRender error:', error);
         state.noticeHtml = null;
         dom.pricesContainer.innerHTML = buildNoticeHtml(
             'error',
@@ -455,7 +431,7 @@ function displayPrices(prices) {
         p.hour <= CONFIG.hourRange.end
     );
     if (filteredPrices.length === 0) {
-        dom.pricesContainer.innerHTML = '<div class="error">Ei hinttoja nykyiselle tai seuraavalle päivälle.</div>';
+        dom.pricesContainer.innerHTML = '<div class="error">Ei hintatietoja nykyiselle tai seuraavalle päivälle.</div>';
         return;
     }
 
@@ -580,18 +556,17 @@ function renderPrices(prices) {
 function renderStats(prices) {
     const now = new Date();
     const today = startOfDay(now);
-    
-    // Laske stats vain tänään olevista hinnoista
+
     const todayPrices = prices
         .filter(p => p.hour >= CONFIG.hourRange.start && p.hour <= CONFIG.hourRange.end)
         .filter(p => p.date.getTime() === today.getTime());
-    
+
     if (todayPrices.length > 0) {
         const pricesValues = todayPrices.map(p => p.price);
         const avgPrice = pricesValues.reduce((a, b) => a + b, 0) / pricesValues.length;
         const minPrice = Math.min(...pricesValues);
         const maxPrice = Math.max(...pricesValues);
-        
+
         dom.avgPrice.textContent = avgPrice.toFixed(3);
         dom.minPrice.textContent = minPrice.toFixed(3);
         dom.maxPrice.textContent = maxPrice.toFixed(3);
@@ -609,8 +584,7 @@ function renderLastUpdate() {
         hour: '2-digit',
         minute: '2-digit'
     });
-    
-    // Käytä latausajan arvoa jos saatavilla
+
     let updateTimeStr = timeStr;
     if (state.data?.fetchedAt) {
         try {
@@ -620,10 +594,10 @@ function renderLastUpdate() {
                 minute: '2-digit'
             });
         } catch (e) {
-            // Jos parsinta epäonnistuu, käytä nykyistä aikaa
+            // ignore parse errors
         }
     }
-    
+
     dom.mainTitle.textContent = `Sähkön tuntihinnat - ${dateStr} klo ${updateTimeStr}`;
     const sourceText = state.data?.source ? ` (lähde: ${state.data.source})` : '';
     dom.lastUpdate.textContent = `Päivitetty: ${updateTimeStr}${sourceText}`;
